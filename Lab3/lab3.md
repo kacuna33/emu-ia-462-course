@@ -17,7 +17,7 @@ You will perform threat-analysis and detection work across all three platforms c
 
 1. **Docker Lab** — Scan a vulnerable container image with Trivy, generate an SBOM with Syft, produce a Grype vulnerability report, rebuild a hardened image, and map findings back to CVEs and MITRE ATT&CK.
 2. **Windows Lab** — Enable Sysmon, generate simulated attacker activity, and write a Sigma-style detection rule pinned to real Event IDs (4624, 4625, 4688, 4104, 4720).
-3. **Linux Lab** — Configure `auditd` rules to catch SUID execution and SSH key modifications, query the environment with `osquery`, and produce a short threat-hunt report.
+3. **Linux Lab** — Use `osquery` to baseline the system, detect a planted SUID binary and SSH-key persistence, and produce a short threat-hunt report.
 
 Everything you produce (reports, rules, screenshots) is pushed to `Lab3/` in the student upload repo.
 
@@ -59,29 +59,60 @@ syft version
 grype version
 ```
 
-### 1B — Pull an Intentionally Vulnerable Base Image
+### 1B — Build an Intentionally Vulnerable Image
+
+A bare `ubuntu:18.04` image is no longer a good scan target: it is EOL, so current Trivy/Grype databases report **0 CRITICAL** findings for it. Instead, you will build a small image on top of `ubuntu:18.04` that installs pinned, known-vulnerable Python libraries (Django 2.2, PyYAML 5.3, urllib3 1.24.1). This guarantees CRITICAL findings to analyze.
 
 ```bash
 mkdir -p ~/lab3/docker && cd ~/lab3/docker
-docker pull ubuntu:18.04
 ```
 
-Ubuntu 18.04 (EOL) is intentionally chosen — it should generate CRITICAL / HIGH findings.
+Create `Dockerfile.vulnerable`:
+
+```dockerfile
+# IA 462 Lab 3 - INTENTIONALLY VULNERABLE image (scan only - never deploy)
+FROM ubuntu:18.04
+
+LABEL description="IA 462 Lab 3 intentionally vulnerable container"
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends python3 python3-pip python3-setuptools && \
+    rm -rf /var/lib/apt/lists/*
+
+# Pinned, known-vulnerable Python libraries (CRITICAL CVEs)
+RUN pip3 install --no-cache-dir \
+    PyYAML==5.3 \
+    Django==2.2 \
+    urllib3==1.24.1
+
+WORKDIR /app
+CMD ["python3", "-m", "http.server", "8080"]
+```
+
+Build it:
+
+```bash
+docker build -t ia462-lab3:vulnerable -f Dockerfile.vulnerable .
+```
+
+> **WARNING:** This image is intentionally vulnerable. Only build and scan it — never run it on a network or push it to a public registry.
 
 ### 1C — Scan with Trivy
 
 ```bash
-trivy image --severity CRITICAL,HIGH,MEDIUM ubuntu:18.04 \
+trivy image --severity CRITICAL,HIGH,MEDIUM ia462-lab3:vulnerable \
   2>&1 | tee lab3-trivy-report.txt
 ```
+
+You should see **at least one CRITICAL** finding in the `python-pkg` targets — for example Django `CVE-2019-14234` / `CVE-2022-28346` (SQL injection) and PyYAML `CVE-2020-14343` / `CVE-2020-1747` (arbitrary code execution). Exact counts change as the vulnerability databases are updated.
 
 **Screenshot 1:** Trivy summary output showing CRITICAL + HIGH counts.
 
 ### 1D — Generate an SBOM with Syft
 
 ```bash
-syft ubuntu:18.04 -o table  | tee lab3-sbom-table.txt
-syft ubuntu:18.04 -o spdx-json > lab3-sbom.spdx.json
+syft ia462-lab3:vulnerable -o table  | tee lab3-sbom-table.txt
+syft ia462-lab3:vulnerable -o spdx-json > lab3-sbom.spdx.json
 jq '.packages | length' lab3-sbom.spdx.json
 ```
 
@@ -93,7 +124,9 @@ jq '.packages | length' lab3-sbom.spdx.json
 grype sbom:lab3-sbom.spdx.json --output table 2>&1 | tee lab3-grype-report.txt
 ```
 
-**Screenshot 3:** Grype output showing severity breakdown.
+Grype should also report **Critical** findings for `django` and `pyyaml`. Note that Grype often lists Python findings by GitHub Advisory ID (`GHSA-xxxx-xxxx-xxxx`); open the advisory at `https://github.com/advisories/<GHSA-ID>` to find the matching CVE ID.
+
+**Screenshot 3:** Grype output showing severity breakdown (including Critical).
 
 ### 1F — Pick One CVE and Enrich With Threat Intel
 
@@ -138,6 +171,14 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
 CMD ["python3", "-m", "http.server", "8080"]
 ```
 
+Create the `index.html` page that the `COPY` line above adds to the image. It must sit in `~/lab3/docker` next to `Dockerfile.hardened` — otherwise the build fails with `"/index.html": not found`:
+
+```bash
+cd ~/lab3/docker
+echo '<h1>IA 462 Lab 3 hardened container</h1>' > index.html
+ls index.html Dockerfile.hardened
+```
+
 Fetch the real digest, replace `REPLACE_WITH_REAL_DIGEST`, then build & re-scan:
 
 ```bash
@@ -149,7 +190,7 @@ docker build -t ia462-lab3:hardened -f Dockerfile.hardened .
 trivy image --severity CRITICAL,HIGH ia462-lab3:hardened | tee lab3-trivy-hardened.txt
 ```
 
-**Screenshot 6:** Trivy output for the hardened image — CRITICAL/HIGH counts should be dramatically lower.
+**Screenshot 6:** Trivy output for the hardened image — the CRITICAL count should drop to **0** and the vulnerable Django/PyYAML/urllib3 findings should be gone. Some HIGH findings in Debian base-image packages may remain; note them in your video.
 
 ---
 
@@ -281,77 +322,84 @@ Stop-Transcript
 
 ---
 
-## Part 3 — Linux: auditd + osquery Threat Hunt
+## Part 3 — Linux: osquery Threat Hunt
 
 Reference: Week 5 slides — *Linux: Auditd & Logging for Threat Detection*.
 
-### 3A — Install auditd + osquery
+> **Note:** The Week 5 slides cover `auditd`, but `auditd` does not run on WSL (the WSL kernel does not support the Linux audit subsystem). This lab uses `osquery` for detection instead, which works on both WSL and an Ubuntu VM.
+
+### 3A — Install osquery
 
 ```bash
 sudo apt update
-sudo apt install -y auditd audispd-plugins
-
-# osquery
-curl -L https://pkg.osquery.io/deb/osquery.pub.asc | sudo apt-key add -
-sudo add-apt-repository -y 'deb [arch=amd64] https://pkg.osquery.io/deb deb main'
+sudo mkdir -p /etc/apt/keyrings
+curl -fsSL https://pkg.osquery.io/deb/pubkey.gpg | sudo tee /etc/apt/keyrings/osquery.asc > /dev/null
+echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/osquery.asc] https://pkg.osquery.io/deb deb main' | sudo tee /etc/apt/sources.list.d/osquery.list
 sudo apt update && sudo apt install -y osquery
 
-systemctl status auditd --no-pager | head -10
 osqueryi --version
 ```
 
-### 3B — Add Detection Rules
+### 3B — Write Hunt Queries & Capture a Baseline
 
-Create `/etc/audit/rules.d/lab3-ia462.rules`:
-
-```
-# ---- IA 462 Lab 3 - detection rules ----
-
-# Watch for SUID/SGID binary execution (mapped to T1548.001)
--a always,exit -F arch=b64 -S execve -F euid=0 -F auid>=1000 -k suid_exec
-
-# Watch changes to authorized_keys - SSH key theft / persistence (T1098.004)
--w /root/.ssh/authorized_keys -p wa -k ssh_key_mod
--w /home -p wa -k home_dir_mod
-
-# Watch modifications to critical auth files (T1098)
--w /etc/passwd  -p wa -k identity
--w /etc/shadow  -p wa -k identity
--w /etc/sudoers -p wa -k identity
-
-# Watch new/loaded kernel modules (T1547.006 / T1014 rootkits)
--w /sbin/insmod  -p x -k module_load
--w /sbin/modprobe -p x -k module_load
--a always,exit -F arch=b64 -S init_module,delete_module -k module_load
-```
-
-Load & confirm:
+Create `~/lab3/lab3-hunt.sql`:
 
 ```bash
-sudo cp /etc/audit/rules.d/lab3-ia462.rules /etc/audit/rules.d/lab3-ia462.rules
-sudo augenrules --load
-sudo auditctl -l
+mkdir -p ~/lab3
+cat > ~/lab3/lab3-hunt.sql <<'SQL'
+-- SUID/SGID binaries (T1548.001)
+SELECT path, username, groupname, permissions FROM suid_bin;
+-- SSH authorized_keys (T1098.004)
+SELECT u.username, a.key_file, a.algorithm, a.comment FROM users u CROSS JOIN authorized_keys a USING (uid);
+-- Critical auth files (T1098 / T1136)
+SELECT path, sha256 FROM hash WHERE path IN ('/etc/passwd', '/etc/shadow', '/etc/sudoers');
+-- Loaded kernel modules (T1547.006 / T1014)
+SELECT name FROM kernel_modules;
+SQL
 ```
 
-**Screenshot 11:** `auditctl -l` showing your rules loaded.
-
-### 3C — Trigger the Rules & Read the Logs
+Capture a baseline of the clean system:
 
 ```bash
-# Trigger suid_exec by running a SUID binary as a normal user
-/usr/bin/passwd --version || true
-
-# Trigger ssh_key_mod
-mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys
-echo "# IA462 Lab3 test line" >> ~/.ssh/authorized_keys
-
-# Read events
-sudo ausearch -k suid_exec  | tail -40 | tee ~/lab3/lab3-suid-events.txt
-sudo ausearch -k ssh_key_mod | tail -40 | tee ~/lab3/lab3-sshkey-events.txt
-sudo aureport --summary
+sudo osqueryi --line < ~/lab3/lab3-hunt.sql > ~/lab3/lab3-osquery-baseline.txt
+less ~/lab3/lab3-osquery-baseline.txt
 ```
 
-**Screenshot 12:** ausearch output for `suid_exec` and `ssh_key_mod` keys.
+**Screenshot 11:** Your baseline output (SUID binaries, authorized_keys, file hashes).
+
+### 3C — Simulate Attacker Activity & Detect It
+
+```bash
+# Plant a test SUID binary (T1548.001) - note euid=0 in the output
+sudo cp /usr/bin/id /usr/local/bin/lab3-suid-test
+sudo chmod u+s /usr/local/bin/lab3-suid-test
+/usr/local/bin/lab3-suid-test
+
+# Add an SSH key for persistence (T1098.004)
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+ssh-keygen -q -t ed25519 -N "" -C ia462-lab3-test -f ~/lab3/lab3-test-key
+cat ~/lab3/lab3-test-key.pub >> ~/.ssh/authorized_keys
+
+# Create a backdoor account - modifies /etc/passwd and /etc/shadow (T1136.001)
+sudo useradd -M -s /usr/sbin/nologin lab3-backdoor
+
+# Re-run the same hunt queries and compare to the baseline
+sudo osqueryi --line < ~/lab3/lab3-hunt.sql > ~/lab3/lab3-osquery-after.txt
+diff ~/lab3/lab3-osquery-baseline.txt ~/lab3/lab3-osquery-after.txt | tee ~/lab3/lab3-osquery-diff.txt
+```
+
+The diff should show the new SUID binary, the new `ia462-lab3-test` key, and changed hashes for `/etc/passwd` and `/etc/shadow`.
+
+**Screenshot 12:** The `diff` output showing all three detections.
+
+Clean up the test activity:
+
+```bash
+sudo rm /usr/local/bin/lab3-suid-test
+sudo userdel lab3-backdoor
+sed -i '/ia462-lab3-test/d' ~/.ssh/authorized_keys
+rm ~/lab3/lab3-test-key ~/lab3/lab3-test-key.pub
+```
 
 ### 3D — Query the Environment with osquery
 
@@ -360,8 +408,8 @@ sudo osqueryi <<'SQL'
 .mode line
 SELECT username, uid, gid, shell, directory FROM users WHERE uid = 0;
 SELECT name, path, cmdline, uid FROM processes WHERE uid = 0 LIMIT 15;
-SELECT path, mode, uid, gid FROM suid_bin LIMIT 20;
-SELECT username, key_file, algorithm, comment FROM authorized_keys LIMIT 10;
+SELECT path, username, groupname, permissions FROM suid_bin LIMIT 20;
+SELECT u.username, a.key_file, a.algorithm, a.comment FROM users u CROSS JOIN authorized_keys a USING (uid) LIMIT 10;
 .exit
 SQL
 ```
@@ -370,7 +418,7 @@ Redirect the output to a file:
 
 ```bash
 sudo osqueryi \
-  "SELECT path, mode, uid, gid FROM suid_bin;" \
+  "SELECT path, username, groupname, permissions FROM suid_bin;" \
   > ~/lab3/lab3-osquery-suid.txt
 ```
 
@@ -380,9 +428,9 @@ sudo osqueryi \
 
 Create `~/lab3/lab3-threat-hunt.md` with:
 
-- **Hypothesis:** "An attacker has established SSH-key-based persistence and is executing SUID binaries to escalate."
-- **Data sources queried:** auditd (`suid_exec`, `ssh_key_mod`), osquery (`users`, `authorized_keys`, `suid_bin`), Windows Security log (4624, 4625, 4688, 4720, 4104).
-- **Findings:** which rules fired, which events were captured, and whether they matched attacker behavior or normal admin activity.
+- **Hypothesis:** "An attacker has established SSH-key-based persistence, created a backdoor account, and planted a SUID binary to escalate."
+- **Data sources queried:** osquery (`suid_bin`, `authorized_keys`, `hash`, `kernel_modules`, `users`, `processes`), Windows Security log (4624, 4625, 4688, 4720, 4104).
+- **Findings:** what changed between your baseline and after snapshots, and whether each change matched attacker behavior or normal admin activity.
 - **MITRE ATT&CK Mapping:** at least three techniques covered (e.g., T1548.001, T1098.004, T1059.001, T1027).
 - **Recommendations:** three concrete hardening actions that would prevent or detect the attack earlier.
 
@@ -433,6 +481,7 @@ cp ~/lab3/docker/lab3-sbom.spdx.json          Lab3/docker/
 cp ~/lab3/docker/lab3-grype-report.txt        Lab3/docker/
 cp ~/lab3/docker/lab3-trivy-hardened.txt      Lab3/docker/
 cp ~/lab3/docker/lab3-cve-writeup.md          Lab3/docker/
+cp ~/lab3/docker/Dockerfile.vulnerable        Lab3/docker/
 cp ~/lab3/docker/Dockerfile.hardened          Lab3/docker/
 cp ~/lab3/docker/index.html                   Lab3/docker/
 
@@ -442,9 +491,10 @@ cp /mnt/c/Users/<you>/Downloads/lab3-win/sysmonconfig.xml        Lab3/windows/
 cp /mnt/c/Users/<you>/Desktop/lab3-suspicious-encoded-powershell.yml Lab3/windows/
 
 # Linux artifacts
-cp /etc/audit/rules.d/lab3-ia462.rules Lab3/linux/
-cp ~/lab3/lab3-suid-events.txt         Lab3/linux/
-cp ~/lab3/lab3-sshkey-events.txt       Lab3/linux/
+cp ~/lab3/lab3-hunt.sql                Lab3/linux/
+cp ~/lab3/lab3-osquery-baseline.txt    Lab3/linux/
+cp ~/lab3/lab3-osquery-after.txt       Lab3/linux/
+cp ~/lab3/lab3-osquery-diff.txt        Lab3/linux/
 cp ~/lab3/lab3-osquery-suid.txt        Lab3/linux/
 cp ~/lab3/lab3-threat-hunt.md          Lab3/linux/
 
@@ -465,10 +515,10 @@ Open a pull request in the student upload repo and screenshot it (`14-lab3-pull-
 
 Record a single `.wmv` video demonstrating:
 
-1. Trivy + Syft + Grype results on `ubuntu:18.04` and the hardened rebuild
+1. Trivy + Syft + Grype results on `ia462-lab3:vulnerable` (showing CRITICAL findings) and the hardened rebuild
 2. Your NVD + MITRE ATT&CK browser pages for the CVE you selected
 3. Sysmon running on Windows + the 4624/4625/4688/4720/4104 events + a walkthrough of your Sigma rule
-4. Your loaded auditd rules + captured suid_exec / ssh_key_mod events
+4. Your osquery baseline vs. after `diff` showing the planted SUID binary, new SSH key, and changed `/etc/passwd` / `/etc/shadow` hashes
 5. osquery output showing SUID binaries and authorized_keys
 6. A read-through of your `lab3-threat-hunt.md` file
 7. Your open pull request with all artifacts visible
@@ -483,10 +533,10 @@ Record a single `.wmv` video demonstrating:
 |------|--------|----------|
 | Video walkthrough | `.wmv` | Yes |
 | Trivy / Syft / Grype reports | `.txt` / `.json` | Yes |
-| Hardened `Dockerfile.hardened` + `index.html` | Text | Yes |
+| `Dockerfile.vulnerable` + hardened `Dockerfile.hardened` + `index.html` | Text | Yes |
 | `lab3-cve-writeup.md` | Markdown | Yes |
 | Windows transcript + Sysmon config + Sigma YAML | Text | Yes |
-| auditd rules + ausearch output + osquery output | Text | Yes |
+| `lab3-hunt.sql` + osquery baseline / after / diff output + osquery output | Text | Yes |
 | `lab3-threat-hunt.md` | Markdown | Yes |
 | Screenshots | `.png` / `.jpg` | Yes |
 | Pull request link | URL | Yes |
@@ -503,7 +553,6 @@ Record a single `.wmv` video demonstrating:
 - **Sysmon:** https://learn.microsoft.com/sysinternals/downloads/sysmon
 - **SwiftOnSecurity Sysmon Config:** https://github.com/SwiftOnSecurity/sysmon-config
 - **Sigma:** https://github.com/SigmaHQ/sigma
-- **auditd Rules:** https://linux.die.net/man/8/auditctl
 - **osquery Docs:** https://osquery.readthedocs.io
 
 ---
